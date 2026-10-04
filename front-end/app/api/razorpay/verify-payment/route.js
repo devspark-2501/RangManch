@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import mongoose from "mongoose";
 import { connectDB } from "@/lib/mongodb";
 import Exhibition from "@/models/Exhibition";
 import Booking from "@/models/Booking";
@@ -13,11 +14,9 @@ export async function POST(req) {
 
     const body = await req.json();
     const {
-      
       razorpayOrderId,
       razorpayPaymentId,
       razorpaySignature,
-      // Vendor info
       vendorName,
       businessName,
       mobile,
@@ -27,7 +26,6 @@ export async function POST(req) {
       social,
       terms,
       extraTableCount,
-      // Exhibition
       exhibitionId,
     } = body;
 
@@ -51,7 +49,7 @@ export async function POST(req) {
       );
     }
 
-    // ── Verify Razorpay signature ─────────────────────────────────────────
+    // ── Verify Razorpay signature ────────────────────────────────────────
     const expectedSignature = crypto
       .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
       .update(`${razorpayOrderId}|${razorpayPaymentId}`)
@@ -64,11 +62,7 @@ export async function POST(req) {
       );
     }
 
-    // ── Idempotency check: has the webhook already processed this order? ─
-    // The webhook (payment.captured) may run before, during, or after this
-    // request — Razorpay can deliver the webhook within milliseconds of
-    // the client-side handler firing. If a Payment already exists for
-    // this orderId, everything has already been created; just report it.
+    // ── Idempotency: webhook may have already processed this order ───────
     const existingPayment = await Payment.findOne({ razorpayOrderId });
     if (existingPayment) {
       if (existingPayment.bookingId) {
@@ -78,12 +72,10 @@ export async function POST(req) {
           { status: 200 }
         );
       }
-      // Payment exists but has no booking yet (e.g. webhook recorded a
-      // Failed/amount-mismatch case) — fall through and let normal flow
-      // attempt booking creation; the unique index still protects us.
+      // Payment exists but no booking yet — fall through, unique index protects us
     }
 
-    // ── Fetch exhibition ─────────────────────────────────────────────────
+    // ── Fetch exhibition (outside transaction — read-only, no race risk) ─
     const exhibition = await Exhibition.findById(exhibitionId).lean();
     if (!exhibition) {
       return Response.json(
@@ -92,7 +84,6 @@ export async function POST(req) {
       );
     }
 
-    // ── Validate category ────────────────────────────────────────────────
     const categoryDef = (exhibition.categoryLimits ?? []).find(
       (c) => c.category === category
     );
@@ -103,70 +94,101 @@ export async function POST(req) {
       );
     }
 
-    // ── Final capacity check before creating booking ──────────────────────
-    const existingCount = await Booking.countDocuments({
-      exhibitionId: exhibition._id,
-      category,
-      status: { $in: CAPACITY_STATUSES },
-    });
-    if (existingCount >= categoryDef.maxSlots) {
-      // Payment went through but category just filled up — flag for refund
-      return Response.json(
-        {
-          success: false,
-          message:
-            "This category just became full. Please contact us for a refund. Reference: " +
-            razorpayPaymentId,
-        },
-        { status: 400 }
-      );
-    }
-
-    // ── Server-side pricing (recalculate — never trust frontend) ─────────
+    // ── Server-side pricing ──────────────────────────────────────────────
     const rawCount       = Number(extraTableCount);
     const safeCount      = Number.isFinite(rawCount) && rawCount >= 0 ? Math.floor(rawCount) : 0;
     const entryCost      = exhibition.entryCost      ?? 0;
     const extraTableCost = exhibition.extraTableCost ?? 0;
     const totalAmount    = entryCost + extraTableCost * safeCount;
 
-    // ── Create Booking + Payment ──────────────────────────────────────────
-    // If the webhook wins the race and inserts a Payment for this same
-    // razorpayOrderId between our check above and this insert, the unique
-    // index on Payment.razorpayOrderId rejects this with E11000 — caught
-    // below so we don't create a duplicate Booking.
-    let booking;
-    try {
-      booking = await Booking.create({
-        vendorName,
-        businessName,
-        mobile,
-        email,
-        category,
-        products:           products   ?? "",
-        social:             social     ?? "",
-        terms:              terms      ?? false,
-        status:             "Confirmed",
-        exhibitionId:       exhibition._id,
-        exhibitionTitle:    exhibition.title,
-        exhibitionDate:     exhibition.date     ?? "",
-        exhibitionLocation: exhibition.location ?? "",
-        entryCost,
-        extraTableCost,
-        extraTableCount:    safeCount,
-        totalAmount,
-      });
+    // ── Atomic capacity check + booking creation (transaction) ───────────
+    //
+    // ROOT CAUSE OF THE BUG:
+    //   Without a transaction, two simultaneous requests both run
+    //   countDocuments, both see count < maxSlots, both pass, both write —
+    //   resulting in more bookings than the limit allows.
+    //
+    // FIX:
+    //   Wrapping countDocuments + Booking.create inside a transaction means
+    //   MongoDB holds a document-level write lock for that category/exhibition
+    //   combination. The second request's countDocuments will block (or see
+    //   the first write) and correctly hit the limit.
+    //
+    // REQUIREMENT: MongoDB replica set (Atlas always qualifies; local dev
+    //   needs --replSet or use mongodb-memory-server with replSet option).
+    //
+    const session = await mongoose.startSession();
 
-      const payment = await Payment.create({
-        bookingId:         booking._id,
-        exhibitionId:      exhibition._id,
-        vendorName,
-        email,
-        mobile,
-        amount:            totalAmount,
-        razorpayOrderId,
-        razorpayPaymentId,
-        razorpaySignature,
-        paymentStatus:     "Paid",
+    try {
+      let booking;
+      let payment;
+
+      await session.withTransaction(async () => {
+        // ── Capacity check — runs inside the transaction ─────────────────
+        const existingCount = await Booking.countDocuments({
+          exhibitionId: exhibition._id,
+          category,
+          status: { $in: CAPACITY_STATUSES },
+        }).session(session);
+
+        if (existingCount >= categoryDef.maxSlots) {
+          // Abort the transaction — no booking, no payment written
+          throw Object.assign(
+            new Error(
+              `This category is full. Please contact us for a refund. Reference: ${razorpayPaymentId}`
+            ),
+            { isFull: true }
+          );
+        }
+
+        // ── Create Booking ───────────────────────────────────────────────
+        // create() with a session requires array syntax
+        const [newBooking] = await Booking.create(
+          [
+            {
+              vendorName,
+              businessName,
+              mobile,
+              email,
+              category,
+              products:           products   ?? "",
+              social:             social     ?? "",
+              terms:              terms      ?? false,
+              status:             "Confirmed",
+              exhibitionId:       exhibition._id,
+              exhibitionTitle:    exhibition.title,
+              exhibitionDate:     exhibition.date     ?? "",
+              exhibitionLocation: exhibition.location ?? "",
+              entryCost,
+              extraTableCost,
+              extraTableCount:    safeCount,
+              totalAmount,
+            },
+          ],
+          { session }
+        );
+
+        // ── Create Payment ───────────────────────────────────────────────
+        const [newPayment] = await Payment.create(
+          [
+            {
+              bookingId:         newBooking._id,
+              exhibitionId:      exhibition._id,
+              vendorName,
+              email,
+              mobile,
+              amount:            totalAmount,
+              razorpayOrderId,
+              razorpayPaymentId,
+              razorpaySignature,
+              paymentStatus:     "Paid",
+            },
+          ],
+          { session }
+        );
+
+        booking = newBooking;
+        payment = newPayment;
       });
 
       return Response.json(
@@ -174,29 +196,30 @@ export async function POST(req) {
         { status: 201 }
       );
     } catch (err) {
+      // ── Category full (thrown inside transaction) ────────────────────
+      if (err.isFull) {
+        return Response.json(
+          { success: false, message: err.message },
+          { status: 400 }
+        );
+      }
+
+      // ── Webhook beat us to it (duplicate key on razorpayOrderId) ─────
       if (err.code === 11000) {
-        // Webhook already created the Payment (and likely the Booking)
-        // for this orderId. Roll back our orphan booking and return the
-        // webhook's version instead of erroring out to the vendor.
-        if (booking) {
-          await Booking.findByIdAndDelete(booking._id);
-        }
         const winningPayment = await Payment.findOne({ razorpayOrderId });
         const winningBooking = winningPayment?.bookingId
           ? await Booking.findById(winningPayment.bookingId).lean()
           : null;
 
         return Response.json(
-          {
-            success: true,
-            booking: winningBooking,
-            payment: winningPayment,
-            alreadyProcessed: true,
-          },
+          { success: true, booking: winningBooking, payment: winningPayment, alreadyProcessed: true },
           { status: 200 }
         );
       }
+
       throw err;
+    } finally {
+      session.endSession();
     }
   } catch (error) {
     console.error("POST /api/razorpay/verify-payment error:", error);
