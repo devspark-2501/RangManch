@@ -61,7 +61,16 @@ export async function POST(req) {
       );
     }
 
-    // ── Capacity check ───────────────────────────────────────────────────
+    // ── Pre-flight capacity check (UX only — NOT the enforcement gate) ───
+    //
+    // This check is intentionally non-atomic: it's a fast, user-friendly
+    // early exit so we don't charge someone for a full category. The real
+    // atomic enforcement happens inside a MongoDB transaction in
+    // /api/razorpay/verify-payment — that is the only check that matters
+    // for correctness. Do NOT add a transaction here; creating a Razorpay
+    // order does not write anything to our DB so there is nothing to roll
+    // back, and locking here would not prevent the race anyway.
+    //
     const existingCount = await Booking.countDocuments({
       exhibitionId: exhibition._id,
       category,
@@ -81,7 +90,6 @@ export async function POST(req) {
     const extraTableCost  = exhibition.extraTableCost ?? 0;
     const totalAmount     = entryCost + extraTableCost * safeCount;
 
-    // Razorpay amount is in paise (₹1 = 100 paise)
     const amountInPaise = totalAmount * 100;
     if (amountInPaise < 100) {
       return Response.json(
@@ -91,11 +99,6 @@ export async function POST(req) {
     }
 
     // ── Create Razorpay order ────────────────────────────────────────────
-    // Notes carry enough vendor + booking context for the webhook
-    // (payment.captured) to independently reconstruct and create a
-    // Booking if it processes the payment before verify-payment does.
-    // Razorpay limits notes to 15 key/value pairs, 256 chars each —
-    // everything below stays comfortably within that.
     const order = await razorpay.orders.create({
       amount:   amountInPaise,
       currency: "INR",
@@ -114,11 +117,11 @@ export async function POST(req) {
     });
 
     return Response.json({
-      success:     true,
-      orderId:     order.id,
-      amount:      totalAmount,
-      amountPaise: amountInPaise,
-      currency:    "INR",
+      success:         true,
+      orderId:         order.id,
+      amount:          totalAmount,
+      amountPaise:     amountInPaise,
+      currency:        "INR",
       entryCost,
       extraTableCost,
       extraTableCount: safeCount,
